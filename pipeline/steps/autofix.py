@@ -27,13 +27,154 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    remove_codes = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+    drop_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+    removals = {}
+    needs_label = set()
+    line_codes = defaultdict(lambda: defaultdict(set))
+    rename_classes = False
+
+    for issue in issues:
+        if issue.severity != ERROR:
+            continue
+        if issue.code.startswith("DUP_IMAGE_") or issue.code in remove_codes:
+            removals.setdefault(issue.image, issue)
+        elif issue.code == "MISSING_LABEL_FILE":
+            needs_label.add(issue.image)
+        elif issue.code == "BAD_CLASS_NAME":
+            rename_classes = True
+        elif issue.code in drop_codes | {"BOX_OUT_OF_IMAGE"} and issue.line is not None:
+            line_codes[issue.image][issue.line].add(issue.code)
+
+    fixes = []
+    removed = set()
+    for stem in sorted(removals):
+        image_path = ds.image_path(stem)
+        label_path = ds.label_path(stem)
+        if image_path is None and not label_path.exists():
+            continue
+        before = image_path.name if image_path is not None else "(không có ảnh)"
+        if image_path is not None:
+            image_path.unlink()
+        label_path.unlink(missing_ok=True)
+        fixes.append({
+            "image": stem,
+            "line": None,
+            "action": "remove_image",
+            "before": before,
+            "after": "đã xoá ảnh và nhãn khỏi dataset làm việc",
+        })
+        removed.add(stem)
+
+    for stem in sorted(needs_label - removed):
+        if ds.image_path(stem) is not None and not ds.label_path(stem).exists():
+            fixes.append({
+                "image": stem,
+                "line": None,
+                "action": "needs_label",
+                "before": "(không có file)",
+                "after": "chuyển người gán",
+            })
+
+    if rename_classes:
+        yaml_path = ds.yaml_path
+        original_text = yaml_path.read_text(encoding="utf-8") if yaml_path.exists() else ""
+        current = yaml.safe_load(original_text) or {}
+        if not isinstance(current, dict):
+            current = {}
+        before_names = current.get("names", "(không có names)")
+        updated = dict(current)
+        updated["names"] = dict(enumerate(cfg["classes"]))
+        updated_text = yaml.safe_dump(updated, allow_unicode=True, sort_keys=False)
+        if updated_text != original_text:
+            yaml_path.write_text(updated_text, encoding="utf-8")
+            fixes.append({
+                "image": "data.yaml",
+                "line": None,
+                "action": "rename_classes",
+                "before": str(before_names),
+                "after": str(cfg["classes"]),
+            })
+
+    for stem in sorted(set(line_codes) - removed):
+        label_path = ds.label_path(stem)
+        if not label_path.exists():
+            continue
+        original_text = label_path.read_text(encoding="utf-8", errors="replace")
+        lines = original_text.splitlines()
+        trailing_newline = original_text.endswith(("\n", "\r"))
+        changes = []
+
+        for line_no in sorted(line_codes[stem]):
+            index = line_no - 1
+            if index < 0 or index >= len(lines) or lines[index] is None:
+                continue
+            line = lines[index]
+            codes = line_codes[stem][line_no]
+
+            if codes & drop_codes:
+                lines[index] = None
+                changes.append({
+                    "image": stem,
+                    "line": line_no,
+                    "action": "drop_line",
+                    "before": line,
+                    "after": "(đã xoá dòng)",
+                })
+                continue
+
+            if "BOX_OUT_OF_IMAGE" in codes:
+                cls, cx, cy, width, height = parse_yolo_line(line)
+                left, top = cx - width / 2, cy - height / 2
+                right, bottom = cx + width / 2, cy + height / 2
+                clipped_left, clipped_top = max(0.0, left), max(0.0, top)
+                clipped_right, clipped_bottom = min(1.0, right), min(1.0, bottom)
+
+                if clipped_right <= clipped_left or clipped_bottom <= clipped_top:
+                    lines[index] = None
+                    changes.append({
+                        "image": stem,
+                        "line": line_no,
+                        "action": "drop_line",
+                        "before": line,
+                        "after": "(box nằm ngoài ảnh, đã xoá dòng)",
+                    })
+                else:
+                    new_width = clipped_right - clipped_left
+                    new_height = clipped_bottom - clipped_top
+                    new_cx = (clipped_left + clipped_right) / 2
+                    new_cy = (clipped_top + clipped_bottom) / 2
+                    after = " ".join((
+                        str(cls),
+                        f"{new_cx:.12g}",
+                        f"{new_cy:.12g}",
+                        f"{new_width:.12g}",
+                        f"{new_height:.12g}",
+                    ))
+                    if after != line:
+                        lines[index] = after
+                        changes.append({
+                            "image": stem,
+                            "line": line_no,
+                            "action": "clip_box",
+                            "before": line,
+                            "after": after,
+                        })
+
+        if changes:
+            remaining = [line for line in lines if line is not None]
+            updated_text = "\n".join(remaining)
+            if trailing_newline and remaining:
+                updated_text += "\n"
+            label_path.write_text(updated_text, encoding="utf-8")
+            fixes.extend(changes)
+
+    return fixes
